@@ -3,7 +3,7 @@
   import AnswerPanel from './lib/components/AnswerPanel.svelte'
   import SourcesPanel from './lib/components/SourcesPanel.svelte'
   import MapPanel from './lib/components/MapPanel.svelte'
-  import { askRentWise } from './lib/api/mockBackend'
+  import { askRentWise } from './lib/api/client'
   import type { AskState } from './lib/types'
 
   let ask = $state<AskState>({ status: 'idle', query: '', response: null, error: null })

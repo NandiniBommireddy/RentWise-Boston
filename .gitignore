@@ -3,4 +3,20 @@ dist/
 .env
 .env.local
 .DS_Store
+
+# Data artifacts — all rebuildable from Analyze Boston:
+#   python -m backend.download && python -m backend.ingest && python -m backend.build_embeddings
 data/downloads/*.csv
+data/*.duckdb
+data/*.duckdb.wal
+data/*.npy
+data/property_embedding_keys.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+backend/.env
+
+# Editor / tool local state
+.claude/settings.local.json
