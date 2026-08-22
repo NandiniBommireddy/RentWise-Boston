@@ -15,8 +15,10 @@ python3 -m venv .venv
 .venv/bin/python -m backend.download
 .venv/bin/python -m backend.ingest
 
-# 3. Optional but recommended: local embeddings for hybrid search (~5-10 min, one time)
-.venv/bin/python -m backend.build_embeddings
+# 3. Optional: local embeddings for hybrid search. Slow on Apple Silicon --
+#    measured well over 30 min for all 86k cards on an 8 GB M2. Prefer --limit,
+#    which covers the busiest properties (the ones questions are actually about).
+.venv/bin/python -m backend.build_embeddings --limit 20000
 
 # 4. Credentials — put your key in backend/.env
 echo 'ANTHROPIC_API_KEY=sk-ant-...' > backend/.env
