@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RentWise Boston — Accessibility Review</title>
+<style>
+  :root {
+    --bg: #faf9f7; --surface: #fff; --text: #1c1917; --muted: #6b7280;
+    --border: #e5e1db; --accent: #c2410c;
+    --serious: #b91c1c; --moderate: #b45309; --minor: #52616e; --pass: #15803d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: var(--bg); color: var(--text); line-height: 1.6; }
+  .page { max-width: 880px; margin: 0 auto; padding: 3rem 1.5rem 4rem; }
+  h1 { margin: 0 0 0.25rem; font-size: 1.9rem; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 2rem; }
+  h2 { font-size: 1.25rem; margin: 2.5rem 0 1rem; border-bottom: 2px solid var(--border); padding-bottom: 0.4rem; }
+  .summary { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1.5rem 0; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem;
+          padding: 0.9rem 1.4rem; text-align: center; flex: 1; min-width: 120px; }
+  .stat b { display: block; font-size: 1.6rem; }
+  .stat span { font-size: 0.8rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .finding { background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem;
+             padding: 1.1rem 1.4rem; margin: 0 0 1rem; }
+  .finding h3 { margin: 0 0 0.5rem; font-size: 1.02rem; display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+  .badge { font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+           color: #fff; border-radius: 999px; padding: 0.15rem 0.6rem; }
+  .badge.serious { background: var(--serious); } .badge.moderate { background: var(--moderate); }
+  .badge.minor { background: var(--minor); } .badge.pass { background: var(--pass); }
+  .wcag { font-size: 0.75rem; color: var(--muted); font-weight: 500; }
+  .finding p { margin: 0.4rem 0; font-size: 0.93rem; }
+  .fix { border-left: 3px solid var(--accent); padding: 0.15rem 0 0.15rem 0.8rem; margin-top: 0.6rem;
+         font-size: 0.9rem; }
+  .fix b { color: var(--accent); }
+  code { background: #f2ede7; border-radius: 0.3em; padding: 0.08em 0.35em; font-size: 0.86em;
+         font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+  .loc { font-size: 0.8rem; color: var(--muted); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; background: var(--surface);
+          border-radius: 0.75rem; overflow: hidden; border: 1px solid var(--border); }
+  th, td { text-align: left; padding: 0.55rem 0.9rem; border-bottom: 1px solid var(--border); }
+  th { background: #f5f2ee; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+  tr:last-child td { border-bottom: none; }
+  .ok { color: var(--pass); font-weight: 600; }
+  footer { margin-top: 3rem; font-size: 0.8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="page">
+  <h1>RentWise Boston — Accessibility Review</h1>
+  <p class="sub">Manual WCAG 2.1 AA review of the Svelte front end · branch <code>feat/rag-backend</code> @ <code>e44a071</code> · August 22, 2026</p>
+
+  <div class="summary">
+    <div class="stat"><b style="color:var(--serious)">2</b><span>Serious</span></div>
+    <div class="stat"><b style="color:var(--moderate)">4</b><span>Moderate</span></div>
+    <div class="stat"><b style="color:var(--minor)">3</b><span>Minor</span></div>
+    <div class="stat"><b style="color:var(--pass)">9</b><span>Passing areas</span></div>
+  </div>
+
+  <h2>Serious</h2>
+
+  <div class="finding">
+    <h3><span class="badge serious">Serious</span> Scrollable regions are not keyboard-operable <span class="wcag">WCAG 2.1.1 Keyboard</span></h3>
+    <p>The locations list, citations list, and the answer card are internally scrollable
+       (<code>overflow-y: auto</code>) to keep the one-page layout, but none are focusable. A keyboard-only
+       user cannot scroll them at all — with 6+ locations or 12 citations, everything below the fold of each
+       panel is unreachable without a mouse.</p>
+    <p class="loc">SourcesPanel.svelte (<code>.locations</code>, <code>.citations</code>) · App.svelte (<code>.answer-row</code>)</p>
+    <div class="fix"><b>Fix:</b> add <code>tabindex="0"</code> plus an accessible name to each scrollable container,
+      e.g. <code>&lt;ul class="locations" tabindex="0" aria-label="Locations referenced"&gt;</code>. Arrow keys then scroll them natively.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge serious">Serious</span> Results are never announced to screen readers <span class="wcag">WCAG 4.1.3 Status Messages</span></h3>
+    <p>The loading state announces itself (<code>role="status"</code> + <code>aria-live="polite"</code> — good),
+       but when the answer arrives that region is <em>removed</em> and the results render silently. A screen-reader
+       user hears "Searching RentSmart records…" and then nothing; they must wander the page to discover the answer
+       appeared. Answers take 5–20s, so this is the app's core interaction.</p>
+    <p class="loc">App.svelte — the <code>{#if}</code> branch swap between loading and done states</p>
+    <div class="fix"><b>Fix:</b> keep one persistent <code>aria-live="polite"</code> region that gets a short message
+      on completion ("Answer ready — N locations found"), or put <code>aria-live="polite"</code> on the answer section
+      itself. Moving focus to the answer heading is an alternative pattern.</div>
+  </div>
+
+  <h2>Moderate</h2>
+
+  <div class="finding">
+    <h3><span class="badge moderate">Moderate</span> Map content has no non-visual or keyboard equivalent surfaced as such <span class="wcag">WCAG 1.1.1 · 2.1.1</span></h3>
+    <p>The Mapbox GL canvas is invisible to assistive tech: markers are not focusable, popups open on click only,
+       and the canvas has no text alternative. The saving grace is that the locations list presents the same data
+       in text — but nothing tells an AT user that the list <em>is</em> the map's equivalent.</p>
+    <p class="loc">MapPanel.svelte · SourcesPanel.svelte</p>
+    <div class="fix"><b>Fix:</b> add <code>role="img"</code> and a summary label to the map container
+      (<code>aria-label="Map of N reported locations; details in the locations list"</code>). Keeping list/map parity
+      (already true today) is the main line of defense — preserve it as the app grows.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge moderate">Moderate</span> Animations ignore <code>prefers-reduced-motion</code> <span class="wcag">WCAG 2.3.3 Animation from Interactions</span></h3>
+    <p>The loading spinner spins unconditionally, and the map performs 1.2-second <code>flyTo</code>/<code>fitBounds</code>
+       camera animations on every result — large full-viewport motion for vestibular-sensitive users.</p>
+    <p class="loc">App.svelte (<code>@keyframes spin</code>) · MapPanel.svelte (<code>duration: 1200</code>)</p>
+    <div class="fix"><b>Fix:</b> wrap the spinner animation in <code>@media (prefers-reduced-motion: no-preference)</code>
+      (falling back to a static indicator), and in MapPanel set <code>duration: 0</code> when
+      <code>matchMedia('(prefers-reduced-motion: reduce)').matches</code>.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge moderate">Moderate</span> Citation links open new tabs without warning, and details hide in <code>title</code> <span class="wcag">WCAG 3.2.2 (advisory) · 1.1.1</span></h3>
+    <p>Every citation link uses <code>target="_blank"</code> with no indication it leaves the app — disorienting for
+       screen-reader and cognitive-load-sensitive users. The record detail is only in the <code>title</code> attribute,
+       which touch users can never see and screen readers expose inconsistently.</p>
+    <p class="loc">SourcesPanel.svelte:39</p>
+    <div class="fix"><b>Fix:</b> append visually-hidden text <code>&lt;span class="sr-only"&gt;(opens data.boston.gov in a new tab)&lt;/span&gt;</code>
+      (or a small ↗ icon with <code>aria-hidden</code> plus the sr-only text), and move the essential parts of
+      <code>detail</code> into visible text or <code>aria-label</code>.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge moderate">Moderate</span> Placeholder is the only visible label, in default (low-contrast) gray <span class="wcag">WCAG 1.4.3 · 3.3.2</span></h3>
+    <p>The query input has a proper <code>aria-label</code> (good) but no visible label; the unstyled placeholder
+       (~<code>#a9a9a9</code> in Chrome, ≈2.6:1 on white) is below the 4.5:1 threshold and vanishes on input, leaving
+       sighted users without a prompt.</p>
+    <p class="loc">QueryBar.svelte:34</p>
+    <div class="fix"><b>Fix:</b> style <code>::placeholder { color: var(--text-muted); opacity: 1 }</code> (4.8:1). The
+      suggestion chips partly compensate for the missing visible label; a small visible label above the field would fully resolve 3.3.2.</div>
+  </div>
+
+  <h2>Minor</h2>
+
+  <div class="finding">
+    <h3><span class="badge minor">Minor</span> Heading hierarchy skips from h1 to h3 <span class="wcag">WCAG 1.3.1 (best practice)</span></h3>
+    <p>"Locations referenced" and "Grounded in N records" are <code>&lt;h3&gt;</code> with no <code>&lt;h2&gt;</code> anywhere,
+       so heading-based navigation presents a gap. The answer card has no heading at all.</p>
+    <p class="loc">SourcesPanel.svelte</p>
+    <div class="fix"><b>Fix:</b> promote the panel headings to <code>h2</code> (they are visually styled already), and give the
+      answer section a visually-hidden <code>h2</code> ("Answer") — this also gives the focus-management fix above a target.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge minor">Minor</span> Dataset tag text is 10.9px <span class="wcag">Readability</span></h3>
+    <p>The RentSmart / Short-Term pills render at <code>0.68rem</code> ≈ 10.9px. Contrast passes (4.8:1) but the size is
+       below comfortable minimums for low-vision users.</p>
+    <p class="loc">SourcesPanel.svelte (<code>.dataset-tag</code>)</p>
+    <div class="fix"><b>Fix:</b> bump to <code>0.75rem</code> (12px); the pill layout absorbs it.</div>
+  </div>
+
+  <div class="finding">
+    <h3><span class="badge minor">Minor</span> No skip link <span class="wcag">WCAG 2.4.1 Bypass Blocks</span></h3>
+    <p>Keyboard users tab through the input and four suggestion chips before reaching results on every visit. Landmarks
+       (<code>header/main/footer</code>) exist, which satisfies 2.4.1 minimally, but a "skip to results" link once results
+       exist would help heavy keyboard users.</p>
+    <div class="fix"><b>Fix:</b> optional; lowest priority. The focus-management fix under "Serious" largely obviates it.</div>
+  </div>
+
+  <h2>What already passes</h2>
+  <table>
+    <tr><th>Area</th><th>Detail</th></tr>
+    <tr><td class="ok">Document basics</td><td><code>lang="en"</code>, descriptive <code>&lt;title&gt;</code>, viewport meta does not disable zoom</td></tr>
+    <tr><td class="ok">Landmarks</td><td><code>header</code> / <code>main</code> / <code>footer</code> plus labeled <code>section</code>s (Answer, Sources, Map)</td></tr>
+    <tr><td class="ok">Text contrast</td><td>Body 15.5:1 · muted <code>#6b7280</code> 4.8:1 · accent links 5.2:1 · button text 5.2:1 · error 4.8:1 — all AA</td></tr>
+    <tr><td class="ok">Loading state</td><td><code>role="status"</code> + <code>aria-live="polite"</code>, spinner correctly <code>aria-hidden</code></td></tr>
+    <tr><td class="ok">Error state</td><td><code>role="alert"</code> announces failures immediately</td></tr>
+    <tr><td class="ok">Form semantics</td><td>Real <code>&lt;form&gt;</code> submit (Enter works), input has <code>aria-label</code>, chips are real <code>&lt;button&gt;</code>s</td></tr>
+    <tr><td class="ok">Focus visibility</td><td>Input replaces removed outline with a 3px ring; buttons/links keep browser default focus outlines</td></tr>
+    <tr><td class="ok">Decorative elements</td><td>List-bullet dots are <code>aria-hidden</code>; no images requiring alt text</td></tr>
+    <tr><td class="ok">Responsive reflow</td><td>Single-column below 860px with no horizontal scroll — verified in the iOS simulator</td></tr>
+  </table>
+
+  <h2>Suggested fix order</h2>
+  <p style="font-size:0.93rem">1. Scrollable-region <code>tabindex</code> (5-minute fix, biggest keyboard win) →
+     2. Results announcement → 3. Reduced motion → 4. Placeholder styling + new-tab indicators →
+     5. Headings/tag size. Items 1–4 are all small, contained diffs — happy to apply the lot in one pass.</p>
+
+  <footer>Manual review by Claude (Fable 5) against WCAG 2.1 AA. Not run: automated axe-core scan (skipped per request)
+     and live screen-reader testing (VoiceOver) — both recommended before shipping beyond the hackathon.</footer>
+</div>
+</body>
+</html>
