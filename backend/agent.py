@@ -20,6 +20,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from .catalog import KnowledgeCatalog, Route
 from .llm import LLMBackend, ToolCall, build_backend
 from .retrieval import RentWiseIndex, RetrievalTrace, SqlNotAllowed
 from .sources import RENTSMART, STR_ELIGIBILITY, SourceRef
@@ -50,8 +51,10 @@ income-restricted projects, updated annually.
 short-term-rental eligibility. This is what search_properties and lookup_property read.
 5. neighborhood_stats — per-neighborhood rollups, including pest/heat/unsafe counts.
 
-# Database schema (for query_database)
-{schema}
+# Knowledge catalog
+{catalog}
+Call describe_data if you need full column lists or the issue-description vocabulary.
+Do not call it otherwise -- it costs a turn.
 
 # How to choose a tool
 - A specific street address in the question -> lookup_property.
@@ -160,6 +163,15 @@ TOOLS = [
         },
     },
     {
+        "name": "describe_data",
+        "description": (
+            "Return full column lists for every table plus the vocabulary of real "
+            "issue-description values. Call this only when you need exact column or "
+            "value names to write SQL, since it costs a turn."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "owner_portfolio",
         "description": (
             "Traverse the owner graph: given an owner or landlord name, return every "
@@ -183,27 +195,50 @@ TOOLS = [
 
 @dataclass
 class AgentResult:
+    """Progressive disclosure, in three tiers.
+
+    Only `answer` is model-generated, and it is capped short -- on a local model every
+    token is ~38ms of wall clock, so prose is the expensive tier. `detail` and
+    `citations` are assembled from catalog-typed facts at no model cost, which makes
+    them both instant and immune to paraphrase drift.
+
+    The UI shows the headline, then reveals detail on demand.
+    """
+
     answer: str
     locations: list[dict] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)
     citations: list[dict] = field(default_factory=list)
+    detail: list[dict] = field(default_factory=list)
     trace: dict = field(default_factory=dict)
 
     def to_response(self) -> dict:
-        """The exact shape src/lib/types.ts expects, plus additive debug fields."""
+        """The exact shape src/lib/types.ts expects, plus additive fields."""
         return {
             "answer": self.answer,
             "locations": self.locations,
             "sources": self.sources,
             "citations": self.citations,
+            "detail": self.detail,
             "trace": self.trace,
         }
 
 
 class RentWiseAgent:
-    def __init__(self, index: RentWiseIndex, backend: LLMBackend | None = None) -> None:
+    def __init__(
+        self,
+        index: RentWiseIndex,
+        backend: LLMBackend | None = None,
+        fast_route: bool = True,
+    ) -> None:
         self.ix = index
         self.backend = backend or build_backend()
+        self.catalog = KnowledgeCatalog(index.con)
+        # Deterministic catalog routing skips the model's tool-selection turn. On a
+        # local model at ~26 tok/s that turn is most of the wall-clock time, so this is
+        # the difference between a demo that feels instant and one that does not.
+        # Disable it to benchmark the fully agentic path.
+        self.fast_route = fast_route
         self._system = self._build_system()
 
     def _build_system(self) -> str:
@@ -242,7 +277,7 @@ class RentWiseAgent:
             str_rows=f"{str_rows:,}",
             income_rows=f"{income_rows:,}",
             card_rows=f"{card_rows:,}",
-            schema=self.ix.schema_prompt(),
+            catalog=self.catalog.compact_prompt(),
             enforcement_share=round(100 * enforcement / max(rentsmart_rows, 1)),
             today=time.strftime("%B %d, %Y"),
             coverage_start=start.strftime("%B %d, %Y"),
@@ -352,12 +387,19 @@ class RentWiseAgent:
             + "\n".join(lines)
         )
 
+    def _tool_describe(self, args: dict, trace: RetrievalTrace) -> str:
+        return (
+            f"TABLES AND COLUMNS\n{self.catalog.schema_prompt()}\n\n"
+            f"COMMON description VALUES\n{self.catalog.vocabulary_prompt()}"
+        )
+
     def _dispatch(self, call: ToolCall, trace: RetrievalTrace) -> str:
         handlers = {
             "search_properties": self._tool_search,
             "lookup_property": self._tool_lookup,
             "query_database": self._tool_sql,
             "owner_portfolio": self._tool_owner,
+            "describe_data": self._tool_describe,
         }
         handler = handlers.get(call.name)
         if handler is None:
@@ -448,10 +490,24 @@ class RentWiseAgent:
         trace = RetrievalTrace()
         started = time.time()
         usage = {"input_tokens": 0, "output_tokens": 0, "cache_read": 0}
-
-        messages = self.backend.start(self._system, question, TOOLS)
+        route: Route | None = None
         answer = ""
         turns = 0
+
+        # --- fast path: catalog decides the tool, model only writes the sentence ---
+        if self.fast_route:
+            route = self.catalog.route(question)
+            if route.confident and route.tool:
+                evidence = self._dispatch(
+                    ToolCall(id="route", name=route.tool, arguments=route.arguments), trace
+                )
+                answer, tokens = self._write_headline(question, evidence)
+                for key, value in tokens.items():
+                    usage[key] = usage.get(key, 0) + value
+                return self._finish(answer, trace, route, 1, usage, started, fast=True)
+
+        # --- agentic path: the model chooses its own tools ---
+        messages = self.backend.start(self._system, question, TOOLS)
 
         for turns in range(1, MAX_TURNS + 1):
             turn = self.backend.step(self._system, messages, TOOLS)
@@ -476,14 +532,60 @@ class RentWiseAgent:
         if not answer:
             answer = self._fallback_answer(question, trace)
 
+        return self._finish(answer, trace, route, turns, usage, started, fast=False)
+
+    # ---------- headline generation (the only generated tier) ----------
+
+    HEADLINE_SYSTEM = (
+        "You are RentWise Boston. Answer the resident's question in at most three "
+        "short sentences, using only the DATA below. Quote real numbers and addresses "
+        "from it. If the data does not answer the question, say so plainly. Do not "
+        "list every record -- the interface shows the details separately. No preamble, "
+        "no bullet points, no headings."
+    )
+
+    def _write_headline(self, question: str, evidence: str) -> tuple[str, dict]:
+        """One short generation over already-retrieved evidence.
+
+        Deliberately does not expose tools: the retrieval decision is already made, so
+        this call cannot wander, and it is capped tight because generation is the
+        dominant cost on local hardware.
+        """
+        prompt = f"QUESTION\n{question}\n\nDATA\n{evidence[:6000]}"
+        messages = self.backend.start(self.HEADLINE_SYSTEM, prompt, [])
+        turn = self.backend.step(self.HEADLINE_SYSTEM, messages, [])
+        text = turn.text.strip()
+        if not text:
+            return (
+                "Retrieved the records below, but the model returned no summary. "
+                "The details and citations are still grounded.",
+                turn.usage,
+            )
+        return text, turn.usage
+
+    # ---------- assembly ----------
+
+    def _finish(
+        self,
+        answer: str,
+        trace: RetrievalTrace,
+        route: Route | None,
+        turns: int,
+        usage: dict,
+        started: float,
+        fast: bool,
+    ) -> AgentResult:
         return AgentResult(
             answer=answer,
             locations=self._build_locations(trace),
             sources=[c.to_line() for c in trace.citations],
             citations=[c.to_dict() for c in trace.citations],
+            detail=self._build_detail(trace),
             trace={
                 "backend": self.backend.name,
                 "turns": turns,
+                "routing": "catalog" if fast else "agentic",
+                "route": route.to_dict() if route else None,
                 "tool_calls": trace.tool_calls,
                 "sql": trace.sql_queries,
                 "dense_enabled": self.ix.dense_enabled,
@@ -491,6 +593,37 @@ class RentWiseAgent:
                 "usage": usage,
             },
         )
+
+    def _build_detail(self, trace: RetrievalTrace) -> list[dict]:
+        """The expandable tier: per-property facts, rendered from data, no model cost."""
+        detail = []
+        seen: set[str] = set()
+        for hit in trace.hits:
+            if not hit.address or hit.address in seen:
+                continue
+            seen.add(hit.address)
+            facts = []
+            if hit.total_records:
+                facts.append({"label": "RentSmart records", "value": str(hit.total_records)})
+            if hit.property_type:
+                facts.append({"label": "Property type", "value": hit.property_type})
+            if hit.year_built:
+                facts.append({"label": "Built", "value": str(hit.year_built)})
+            if hit.owner:
+                facts.append({"label": "Owner", "value": hit.owner})
+            if hit.top_issue:
+                facts.append({"label": "Most common issue", "value": hit.top_issue})
+            detail.append(
+                {
+                    "address": hit.address,
+                    "neighborhood": hit.neighborhood or "",
+                    "retriever": hit.retriever,
+                    "facts": facts,
+                }
+            )
+            if len(detail) >= MAX_LOCATIONS:
+                break
+        return detail
 
     def _fallback_answer(self, question: str, trace: RetrievalTrace) -> str:
         """Retrieval-only answer, used when no model is configured.
@@ -504,9 +637,9 @@ class RentWiseAgent:
             trace.add_citations(hit.citations())
         if not hits:
             return (
-                "No language model is configured, so I can only run retrieval — and "
-                "retrieval found nothing for this question. Set ANTHROPIC_API_KEY in "
-                "backend/.env for real answers."
+                "No local model is running, so I can only do retrieval — and retrieval "
+                "found nothing for this question. Start a model to get real answers:\n"
+                "    OLLAMA_CONTEXT_LENGTH=16384 ollama serve"
             )
         lines = [
             f"• {h.address} ({h.neighborhood}) — {h.total_records} records, "
@@ -514,9 +647,9 @@ class RentWiseAgent:
             for h in hits
         ]
         return (
-            "No language model is configured, so this is raw retrieval output rather "
-            "than a written answer. The most relevant properties were:\n\n"
+            "No local model is running, so this is raw retrieval output rather than a "
+            "written answer. The most relevant properties were:\n\n"
             + "\n".join(lines)
-            + "\n\nSet ANTHROPIC_API_KEY in backend/.env (or RENTWISE_LLM=local) to get "
-            "grounded prose answers."
+            + "\n\nStart a model for grounded prose answers:\n"
+            "    OLLAMA_CONTEXT_LENGTH=16384 ollama serve"
         )

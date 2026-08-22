@@ -1,10 +1,13 @@
-# 1.x: sampling params removed, output_config replaces raw output_format dicts.
-anthropic>=1,<2
-duckdb>=1.1.0
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-python-dotenv>=1.0.0
+# RentWise runs entirely on local models and open-source tooling.
+# No hosted LLM SDKs -- generation goes to a local OpenAI-compatible server
+# (ollama / llama.cpp / LM Studio / vLLM) over plain HTTP via urllib.
 
-# Local ONNX embeddings for the dense half of hybrid search.
+duckdb>=1.1.0          # MIT -- storage, BM25 via the fts extension, text-to-SQL
+fastapi>=0.115.0       # MIT -- POST /api/ask
+uvicorn[standard]>=0.32.0  # BSD-3
+python-dotenv>=1.0.0   # BSD-3
+
+# Local ONNX embeddings for the dense half of hybrid search (Apache-2.0).
+# Model: BAAI/bge-small-en-v1.5 (MIT). No PyTorch, no network calls at query time.
 # Optional: the backend degrades to BM25-only if this import fails.
 fastembed>=0.4.0

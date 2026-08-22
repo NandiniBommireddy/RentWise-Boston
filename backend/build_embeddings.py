@@ -19,25 +19,53 @@ import duckdb
 from .retrieval import DB_PATH, EMBED_KEYS_PATH, EMBED_MODEL, EMBED_PATH
 
 
+# Embedding all 86k cards needs more memory than an 8 GB machine has spare; it swaps
+# and takes over an hour. So the default is a bounded slice of the busiest properties
+# -- the ones questions are actually about -- and the full run is opt-in via --all.
+DEFAULT_LIMIT = 20_000
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build local embeddings for property cards.")
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--limit", type=int, default=None, help="embed only the N busiest properties")
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_LIMIT,
+        help=f"embed only the N busiest properties (default {DEFAULT_LIMIT})",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="embed every property card. Slow and memory-hungry: expect 1h+ and heavy "
+        "swapping on 8 GB. Prefer the default.",
+    )
     args = parser.parse_args()
 
     import numpy as np
     from fastembed import TextEmbedding
 
     con = duckdb.connect(str(DB_PATH), read_only=True)
+    total_cards = con.execute("SELECT count(*) FROM property_docs").fetchone()[0]
+    # Order by history depth so a bounded run covers the properties most likely to be
+    # asked about, rather than an arbitrary slice.
     sql = """
         SELECT d.addr_key, d.card_text
         FROM property_docs d JOIN property_cards c USING (addr_key)
         ORDER BY c.total_records DESC
     """
-    if args.limit:
+    if not args.all:
         sql += f" LIMIT {args.limit}"
     rows = con.execute(sql).fetchall()
     con.close()
+
+    if args.all:
+        print(f"[embed] --all: embedding every one of {total_cards:,} cards. This is slow.")
+    else:
+        print(
+            f"[embed] {len(rows):,} of {total_cards:,} cards (busiest first). "
+            f"Use --all for everything, or --limit N to change this."
+        )
 
     keys = [r[0] for r in rows]
     texts = [r[1] for r in rows]

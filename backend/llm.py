@@ -1,19 +1,31 @@
-"""Pluggable generation backend.
+"""Local generation backend. No cloud APIs.
 
-The retrieval stack (DuckDB, BM25, local ONNX embeddings) is entirely local and
-open-source. Generation is the one step that can go either way, so it sits behind a
-small protocol with two implementations:
+RentWise runs entirely on the machine in front of you. Retrieval is DuckDB + its FTS
+extension for BM25 + bge-small ONNX embeddings; generation is a local model served
+over an OpenAI-compatible HTTP endpoint. Nothing in this file talks to a hosted API.
 
-  * ClaudeBackend -- Claude via the Anthropic SDK. Reliable multi-turn tool calling,
-    which the agent depends on. This is the demo default.
-  * LocalBackend  -- any OpenAI-compatible local server (ollama, llama.cpp,
-    LM Studio, vLLM). Set RENTWISE_LLM=local to claim the fully-offline path.
-  * NullBackend   -- no model at all. Retrieval still runs and answers are rendered
-    from templates, so the pipeline is demonstrable with no credentials. Not a
-    substitute for the real thing; it exists so a missing key never blocks a demo.
+Two implementations:
 
-Selection is by env var so the toggle can be shown live:
-    RENTWISE_LLM=claude | local | none
+  * LocalBackend -- any OpenAI-compatible server: ollama, llama.cpp's llama-server,
+    LM Studio, vLLM. Selected by default.
+  * NullBackend  -- no model at all. Retrieval still runs and answers are rendered
+    from templates, so the pipeline is demonstrable before a model is pulled.
+
+    RENTWISE_LLM=local | none
+
+## Context length matters more than anything else here
+
+The agent sends a ~1,500-token system prompt, ~800 tokens of tool schemas, and up to
+~1,500 tokens of retrieved property cards per turn. That is comfortably past ollama's
+default 4096-token context, and ollama does not error when you exceed it -- it
+silently drops the oldest tokens, which usually means the tool definitions vanish and
+the model stops calling tools for no visible reason.
+
+Start the server with a real context window:
+
+    OLLAMA_CONTEXT_LENGTH=16384 ollama serve
+
+`LocalBackend.probe()` checks this at startup and warns loudly if it looks too small.
 """
 
 from __future__ import annotations
@@ -21,14 +33,26 @@ from __future__ import annotations
 import json
 import logging
 import os
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 log = logging.getLogger(__name__)
 
-CLAUDE_MODEL = os.environ.get("RENTWISE_CLAUDE_MODEL", "claude-opus-5")
-LOCAL_MODEL = os.environ.get("RENTWISE_LOCAL_MODEL", "qwen3:4b")
+# A non-reasoning instruct model, deliberately. Qwen3 is a hybrid-reasoning model and
+# emits 700-900 hidden thinking tokens even for a two-sentence answer; at the ~26 tok/s
+# this class of hardware sustains, that is 30-70s per question. Neither ollama's
+# `think: false` nor Qwen3's `/no_think` switch suppressed it. Swapping to a plain
+# instruct model cut the same answers to 56-75 output tokens and 2-3s, a 17-22x
+# improvement, and the model is smaller (1.9 GB vs 2.5 GB).
+LOCAL_MODEL = os.environ.get("RENTWISE_LOCAL_MODEL", "qwen2.5:3b-instruct")
 LOCAL_BASE_URL = os.environ.get("RENTWISE_LOCAL_BASE_URL", "http://localhost:11434/v1")
+LOCAL_TIMEOUT = int(os.environ.get("RENTWISE_LOCAL_TIMEOUT", "600"))
+LOCAL_MAX_TOKENS = int(os.environ.get("RENTWISE_LOCAL_MAX_TOKENS", "2048"))
+
+# Below this, tool definitions get silently truncated out of the prompt.
+MIN_SAFE_CONTEXT = 8192
 
 
 @dataclass
@@ -68,97 +92,12 @@ class LLMBackend(Protocol):
         """Append tool results to history."""
 
 
-class ClaudeBackend:
-    """Claude via the Anthropic SDK (>=1.0).
-
-    Adaptive thinking is on and effort is high, because choosing a retrieval path and
-    writing correct SQL over an 8-table schema is exactly the kind of work that
-    benefits from it. Sampling parameters are deliberately absent -- they were removed
-    in SDK 1.x and current models do not use them.
-    """
-
-    name = "claude"
-
-    def __init__(self, model: str = CLAUDE_MODEL, max_tokens: int = 8000) -> None:
-        import anthropic
-
-        self._anthropic = anthropic
-        self.client = anthropic.Anthropic()
-        # The client constructs happily with no credentials and only fails on the
-        # first request, which would surface as a 500 mid-demo. Fail here instead so
-        # build_backend() can fall back while the server is still starting.
-        if not (self.client.api_key or self.client.auth_token):
-            raise RuntimeError(
-                "no Anthropic credentials found -- set ANTHROPIC_API_KEY in backend/.env"
-            )
-        self.model = model
-        self.max_tokens = max_tokens
-
-    def start(self, system: str, user: str, tools: list[dict]) -> list[Any]:
-        return [{"role": "user", "content": user}]
-
-    def step(self, system: str, messages: list[Any], tools: list[dict]) -> Turn:
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            # Cache the system prompt + schema: it is identical on every request and
-            # is the largest stable prefix we send.
-            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-            tools=[
-                {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "input_schema": t["input_schema"],
-                }
-                for t in tools
-            ],
-            messages=messages,
-        )
-
-        if response.stop_reason == "refusal":
-            detail = getattr(response.stop_details, "explanation", None) or "policy refusal"
-            raise RuntimeError(f"Claude declined this request: {detail}")
-
-        text = "".join(b.text for b in response.content if b.type == "text")
-        calls = [
-            ToolCall(id=b.id, name=b.name, arguments=dict(b.input))
-            for b in response.content
-            if b.type == "tool_use"
-        ]
-        usage = {
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-            "cache_read": getattr(response.usage, "cache_read_input_tokens", 0) or 0,
-        }
-        return Turn(text=text, tool_calls=calls, raw=response, usage=usage)
-
-    def append_turn(self, messages: list[Any], turn: Turn) -> None:
-        # Append the whole content list, not just text -- thinking blocks must be
-        # echoed back unchanged for the model to continue its own reasoning.
-        messages.append({"role": "assistant", "content": turn.raw.content})
-
-    def append_results(self, messages: list[Any], results: list[tuple[ToolCall, str]]) -> None:
-        # All tool results for one assistant turn go in a SINGLE user message.
-        # Splitting them teaches the model to stop making parallel calls.
-        messages.append(
-            {
-                "role": "user",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": call.id, "content": output}
-                    for call, output in results
-                ],
-            }
-        )
+class LocalModelUnavailable(RuntimeError):
+    """No local server reachable, or the requested model is not pulled."""
 
 
 class LocalBackend:
-    """Any OpenAI-compatible local server -- ollama, llama.cpp, LM Studio, vLLM.
-
-    Uses urllib rather than the openai package to keep the dependency surface small;
-    the chat-completions tool-calling shape is stable enough to hand-roll.
-    """
+    """A local model behind an OpenAI-compatible /chat/completions endpoint."""
 
     name = "local"
 
@@ -166,71 +105,163 @@ class LocalBackend:
         self,
         model: str = LOCAL_MODEL,
         base_url: str = LOCAL_BASE_URL,
-        max_tokens: int = 4000,
+        max_tokens: int = LOCAL_MAX_TOKENS,
+        timeout: int = LOCAL_TIMEOUT,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.max_tokens = max_tokens
+        self.timeout = timeout
+
+    # ---------- startup checks ----------
+
+    def probe(self) -> dict:
+        """Verify the server is up, the model exists, and the context is big enough.
+
+        Called at startup so a misconfigured local model fails on boot with an
+        actionable message, rather than halfway through a demo query.
+        """
+        info: dict = {"model": self.model, "base_url": self.base_url}
+
+        try:
+            with urllib.request.urlopen(f"{self.base_url}/models", timeout=10) as resp:
+                listed = json.loads(resp.read())
+        except urllib.error.URLError as exc:
+            raise LocalModelUnavailable(
+                f"No local model server at {self.base_url}. Start one:\n"
+                f"    OLLAMA_CONTEXT_LENGTH=16384 ollama serve"
+            ) from exc
+
+        available = [m.get("id") for m in listed.get("data", [])]
+        info["available"] = available
+        if available and self.model not in available:
+            raise LocalModelUnavailable(
+                f"Model {self.model!r} is not available. Pulled models: "
+                f"{', '.join(available) or 'none'}.\n"
+                f"    ollama pull {self.model}"
+            )
+
+        info["context_length"] = self._context_length()
+        if info["context_length"] and info["context_length"] < MIN_SAFE_CONTEXT:
+            log.warning(
+                "Local model context is %s tokens, below the %s needed for the tool "
+                "schemas and retrieved cards. Tool definitions will be silently "
+                "truncated and the agent will stop calling tools. Restart with: "
+                "OLLAMA_CONTEXT_LENGTH=16384 ollama serve",
+                info["context_length"],
+                MIN_SAFE_CONTEXT,
+            )
+        return info
+
+    def _context_length(self) -> int | None:
+        """Read the context window ollama is *actually serving*.
+
+        `/api/show` reports the model's trained maximum (262144 for Qwen3), which is
+        useless for this check: it reads the same whether the server was started with
+        a 4096-token window or a 32k one, so it would fail to warn in precisely the
+        case this exists to catch. `/api/ps` reports the real per-model runtime value,
+        but only once the model is loaded -- so warm it first.
+
+        ollama-specific and best-effort. Returns None on any other server, which is
+        not an error.
+        """
+        root = self.base_url.removesuffix("/v1")
+
+        def served() -> int | None:
+            try:
+                with urllib.request.urlopen(f"{root}/api/ps", timeout=10) as resp:
+                    running = json.loads(resp.read())
+            except Exception:  # noqa: BLE001 - not ollama, or an older version
+                return None
+            for entry in running.get("models") or []:
+                if entry.get("model") == self.model and entry.get("context_length"):
+                    return int(entry["context_length"])
+            return None
+
+        if (length := served()) is not None:
+            return length
+
+        # Not resident yet. A minimal completion loads it, which also means the first
+        # real question does not pay the model-load latency mid-demo.
+        log.info("warming %s ...", self.model)
+        try:
+            self._post(
+                {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 1,
+                }
+            )
+        except LocalModelUnavailable:
+            return None
+        return served()
+
+    # ---------- generation ----------
 
     def _post(self, payload: dict) -> dict:
-        import urllib.error
-        import urllib.request
-
         req = urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json", "Authorization": "Bearer local"},
         )
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode(errors="replace")[:500]
+            raise LocalModelUnavailable(
+                f"Local model returned HTTP {exc.code}: {body}"
+            ) from exc
         except urllib.error.URLError as exc:
-            raise RuntimeError(
-                f"No local model server at {self.base_url}. Start one, e.g. "
-                f"`ollama serve` after `ollama pull {self.model}`."
+            raise LocalModelUnavailable(
+                f"Lost the local model server at {self.base_url}: {exc}"
             ) from exc
 
     def start(self, system: str, user: str, tools: list[dict]) -> list[Any]:
         return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
     def step(self, system: str, messages: list[Any], tools: list[dict]) -> Turn:
-        data = self._post(
-            {
-                "model": self.model,
-                "max_tokens": self.max_tokens,
-                "messages": messages,
-                "tools": [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": t["name"],
-                            "description": t["description"],
-                            "parameters": t["input_schema"],
-                        },
-                    }
-                    for t in tools
-                ],
-            }
-        )
-        choice = data["choices"][0]["message"]
+        payload: dict = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "messages": messages,
+        }
+        # Omit `tools` entirely when empty rather than sending []. Some
+        # OpenAI-compatible servers reject an empty array, and the headline pass
+        # deliberately runs without tools.
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": t["name"],
+                        "description": t["description"],
+                        "parameters": t["input_schema"],
+                    },
+                }
+                for t in tools
+            ]
+        data = self._post(payload)
+
+        choices = data.get("choices") or []
+        if not choices:
+            raise LocalModelUnavailable(f"Local model returned no choices: {data}")
+        message = choices[0].get("message") or {}
+
         calls = []
-        for tc in choice.get("tool_calls") or []:
-            fn = tc["function"]
-            raw_args = fn.get("arguments") or "{}"
-            try:
-                # Small local models occasionally emit malformed JSON here; a bad
-                # parse should cost one retry turn, not crash the request.
-                args = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args)
-            except json.JSONDecodeError:
-                log.warning("local model emitted invalid tool JSON: %r", raw_args)
-                args = {}
-            calls.append(ToolCall(id=tc.get("id") or fn["name"], name=fn["name"], arguments=args))
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            if not name:
+                continue
+            raw_args = fn.get("arguments")
+            calls.append(ToolCall(id=tc.get("id") or name, name=name, arguments=_parse_args(raw_args)))
 
         usage = data.get("usage") or {}
         return Turn(
-            text=choice.get("content") or "",
+            text=(message.get("content") or "").strip(),
             tool_calls=calls,
-            raw=choice,
+            raw=message,
             usage={
                 "input_tokens": usage.get("prompt_tokens", 0),
                 "output_tokens": usage.get("completion_tokens", 0),
@@ -238,30 +269,37 @@ class LocalBackend:
         )
 
     def append_turn(self, messages: list[Any], turn: Turn) -> None:
-        messages.append(
-            {
-                "role": "assistant",
-                "content": turn.text,
-                "tool_calls": [
-                    {
-                        "id": c.id,
-                        "type": "function",
-                        "function": {"name": c.name, "arguments": json.dumps(c.arguments)},
-                    }
-                    for c in turn.tool_calls
-                ],
-            }
-        )
+        entry: dict = {"role": "assistant", "content": turn.text}
+        if turn.tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id": c.id,
+                    "type": "function",
+                    "function": {"name": c.name, "arguments": json.dumps(c.arguments)},
+                }
+                for c in turn.tool_calls
+            ]
+        messages.append(entry)
 
     def append_results(self, messages: list[Any], results: list[tuple[ToolCall, str]]) -> None:
         for call, output in results:
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": output})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "content": output,
+                }
+            )
 
 
 class NullBackend:
     """No model. Retrieval runs; the answer is templated from what was retrieved."""
 
     name = "none"
+
+    def probe(self) -> dict:
+        return {"model": None}
 
     def start(self, system: str, user: str, tools: list[dict]) -> list[Any]:
         return [{"role": "user", "content": user}]
@@ -276,16 +314,61 @@ class NullBackend:
         pass
 
 
+def _parse_args(raw: Any) -> dict[str, Any]:
+    """Coerce a tool-call argument payload into a dict.
+
+    Small local models are noticeably less reliable here than hosted ones: arguments
+    arrive as a JSON string, as an already-decoded dict, as double-encoded JSON, or as
+    something malformed. Recovering instead of raising costs one retry turn rather
+    than the whole request.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            log.warning("local model emitted invalid tool-call JSON: %r", text[:200])
+            return {}
+        # Double-encoded: json.loads gave us another JSON string.
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except json.JSONDecodeError:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
 def build_backend(kind: str | None = None) -> LLMBackend:
-    kind = (kind or os.environ.get("RENTWISE_LLM") or "claude").lower()
-    if kind == "local":
-        return LocalBackend()
+    kind = (kind or os.environ.get("RENTWISE_LLM") or "local").lower()
+
     if kind in {"none", "null", "off"}:
         return NullBackend()
-    if kind != "claude":
-        raise ValueError(f"unknown RENTWISE_LLM={kind!r} (expected claude|local|none)")
+
+    if kind in {"claude", "anthropic", "openai"}:
+        raise ValueError(
+            f"RENTWISE_LLM={kind!r} is not supported -- RentWise runs entirely on "
+            "local models. Use RENTWISE_LLM=local (default) or 'none'."
+        )
+
+    if kind != "local":
+        raise ValueError(f"unknown RENTWISE_LLM={kind!r} (expected local|none)")
+
+    backend = LocalBackend()
     try:
-        return ClaudeBackend()
-    except Exception as exc:  # noqa: BLE001 - missing key must not be a hard crash
-        log.warning("Claude backend unavailable (%s); falling back to retrieval-only.", exc)
+        info = backend.probe()
+    except LocalModelUnavailable as exc:
+        log.warning("Local model unavailable, falling back to retrieval-only.\n%s", exc)
         return NullBackend()
+    log.info(
+        "local model ready: %s (context %s)",
+        info.get("model"),
+        info.get("context_length") or "unknown",
+    )
+    return backend

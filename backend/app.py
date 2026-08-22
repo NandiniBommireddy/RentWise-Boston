@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Load backend/.env before the Anthropic client is constructed.
+# Load backend/.env before the backend reads RENTWISE_* configuration.
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from .agent import RentWiseAgent  # noqa: E402 - must follow load_dotenv

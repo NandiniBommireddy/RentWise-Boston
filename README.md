@@ -49,10 +49,15 @@ If the map panel says "Mapbox token needed", your `.env` is missing or the token
 Agentic RAG over three Analyze Boston datasets. Full documentation — architecture,
 tool design, data caveats, configuration — is in **[`backend/README.md`](backend/README.md)**.
 
+**Everything runs locally. There are no cloud APIs and no API keys anywhere in this
+project.** Generation is a local model served by [ollama](https://ollama.com); retrieval
+is DuckDB plus local ONNX embeddings.
+
 ### Prerequisites
 
 - Python 3.10 or newer (3.13 recommended)
-- An [Anthropic API key](https://console.anthropic.com/settings/keys) — or run without one, see below
+- [ollama](https://ollama.com) — or any OpenAI-compatible local server (llama.cpp, LM Studio, vLLM)
+- **8 GB RAM minimum**, 16 GB comfortable. See the model table below.
 
 ### Setup, from a fresh clone
 
@@ -69,9 +74,32 @@ python3 -m venv .venv
 # 3. Build the DuckDB database + BM25 index (~7 seconds)
 .venv/bin/python -m backend.ingest
 
-# 4. Your Anthropic key
-echo 'ANTHROPIC_API_KEY=sk-ant-...' > backend/.env
+# 4. The local model
+brew install ollama
+ollama pull qwen2.5:3b-instruct
 ```
+
+#### Pick a model for your machine
+
+**Use a non-reasoning instruct model.** This is measured, not a preference. Qwen3 is a
+hybrid-reasoning model and emits 700–900 hidden thinking tokens even for a
+two-sentence answer; at the ~26 tok/s an M2 sustains, that is 30–70 s per question.
+Neither ollama's `think: false` nor Qwen3's `/no_think` switch suppressed it.
+
+Measured on an 8 GB M2, same questions, same pipeline:
+
+| Model | Address question | Owner question | Output tokens |
+| --- | --- | --- | --- |
+| `qwen3:4b` | 33.7 s | 74.2 s | 760–900 |
+| `qwen2.5:3b-instruct` | **2.0 s** | **3.4 s** | **56–75** |
+
+| Your RAM | Model | Notes |
+| --- | --- | --- |
+| 8 GB | `qwen2.5:3b-instruct` | 1.9 GB. The default |
+| 16 GB | `qwen2.5:7b-instruct` | Better tool selection and SQL |
+| 32 GB+ | `qwen2.5:14b-instruct` | Best of the three |
+
+Set a non-default model with `RENTWISE_LOCAL_MODEL=qwen2.5:7b-instruct`.
 
 Step 2 writes `data/downloads/*.csv`; step 3 writes `data/rentwise.duckdb`. Both are
 gitignored and fully rebuildable, so never commit them. Re-run steps 2–3 any time to
@@ -81,20 +109,34 @@ pick up fresh data — RentSmart and the rental-eligibility file both refresh da
 BM25-only), but embeddings make paraphrased questions much better:
 
 ```bash
-.venv/bin/python -m backend.build_embeddings                  # all 86k cards, slow
-.venv/bin/python -m backend.build_embeddings --limit 20000    # busiest 20k, ~2 min
+.venv/bin/python -m backend.build_embeddings          # busiest 20k cards (default)
 ```
+
+The default embeds the 20,000 properties with the most history — the ones questions are
+actually about — because that fits comfortably in memory.
+
+> **Don't pass `--all` on 8 GB.** Embedding all 86k cards swaps heavily and takes over
+> an hour; it will make the machine unusable while it runs. It is opt-in for that
+> reason. Hybrid search works fine on the bounded set, and works at all with no
+> embeddings whatsoever (BM25-only).
 
 ### Run
 
-Two processes, two terminals:
+Three processes. The model server has to come first:
 
 ```bash
-.venv/bin/uvicorn backend.app:app --port 8000 --reload   # terminal 1 — backend
-npm run dev                                              # terminal 2 — frontend
+OLLAMA_CONTEXT_LENGTH=16384 ollama serve                 # terminal 1 — model
+.venv/bin/uvicorn backend.app:app --port 8000 --reload   # terminal 2 — backend
+npm run dev                                              # terminal 3 — frontend
 ```
 
 Then open http://localhost:5173.
+
+> **`OLLAMA_CONTEXT_LENGTH` is not optional.** ollama defaults to 4096 tokens, and the
+> agent's system prompt, tool schemas and retrieved property cards exceed that. ollama
+> does not error when you overflow — it silently drops the oldest tokens, which usually
+> throws away the tool definitions, and the model then stops calling tools for no
+> visible reason. The backend warns at startup if it detects a small context.
 
 ### Check it's working
 
@@ -103,14 +145,15 @@ curl localhost:8000/api/health
 ```
 
 ```json
-{"status":"ok","llm_backend":"claude","dense_retrieval":true,
+{"status":"ok","llm_backend":"local","dense_retrieval":true,
  "tables":{"rentsmart":389121,"str_eligibility":396167,"property_cards":86397}}
 ```
 
-- `llm_backend: "claude"` — key found, agent is live.
-- `llm_backend: "none"` — **no key found.** The server still runs and retrieval still
-  works, but answers are raw retrieval output instead of written prose. Check
-  `backend/.env`.
+- `llm_backend: "local"` — model reachable, agent is live.
+- `llm_backend: "none"` — **no model server reachable, or the model isn't pulled.** The
+  server still runs and retrieval still works, but answers are raw retrieval output
+  instead of written prose. Check that `ollama serve` is up and `ollama list` shows your
+  model. The backend logs the specific reason at startup.
 - `dense_retrieval: false` — embeddings not built; BM25-only. Fine, just less accurate
   on paraphrased questions.
 
@@ -121,12 +164,23 @@ curl localhost:8000/api/health
 | "Could not reach the RAG backend" in the UI | uvicorn isn't running on port 8000 |
 | `FileNotFoundError: data/rentwise.duckdb` | you skipped `backend.ingest` |
 | `Missing required CSV(s)` | you skipped `backend.download` |
-| Answers look like bullet lists of addresses | no API key — see `llm_backend` above |
+| Answers look like bullet lists of addresses | no model reachable — see `llm_backend` above |
+| `No local model server at ...` | `ollama serve` isn't running |
+| `Model '...' is not available` | run `ollama pull qwen2.5:3b-instruct` |
+| Model answers but never uses the data | context too small — restart with `OLLAMA_CONTEXT_LENGTH=16384` |
+| Very slow first answer | the model is loading into RAM; the second query is much faster |
 | Map says "Mapbox token needed" | root `.env` missing `VITE_MAPBOX_TOKEN` |
 
 ### Questions worth trying
 
+These take the fast catalog route and are reliable (1–4 s):
+
 - `is 44 Portsmouth St a good place to rent?` — exact address lookup
-- `which neighborhood has the worst rat problem?` — routes to SQL, since retrieval can't count
-- `what else does GBM Portfolio Owner own?` — owner-graph traversal, 144 properties
-- `can I list my place in Dorchester on Airbnb?` — short-term-rental eligibility
+- `where are the rat problems in Dorchester?` — catalog-expanded hybrid search
+- `what else does GBM Portfolio Owner LLC own?` — owner-graph traversal
+- `can I list 73 Hemenway St on Airbnb?` — short-term-rental eligibility
+- `what is the meaning of life?` — should decline rather than invent
+
+Counting, ranking and trend questions ("how many…", "which neighborhood has the
+most…", "getting better or worse") are **not reliable yet** — see Known limitations in
+[`backend/README.md`](backend/README.md#known-limitations).
