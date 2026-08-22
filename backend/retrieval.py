@@ -205,6 +205,10 @@ class RentWiseIndex:
     def dense_enabled(self) -> bool:
         return self._embeddings is not None and self._embedder is not None
 
+    @property
+    def dense_count(self) -> int:
+        return 0 if self._embeddings is None else int(self._embeddings.shape[0])
+
     def search_dense(self, query: str, k: int = 8) -> list[PropertyHit]:
         if not self.dense_enabled:
             return []

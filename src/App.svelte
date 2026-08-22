@@ -3,10 +3,19 @@
   import AnswerPanel from './lib/components/AnswerPanel.svelte'
   import SourcesPanel from './lib/components/SourcesPanel.svelte'
   import MapPanel from './lib/components/MapPanel.svelte'
-  import { askRentWise } from './lib/api/client'
+  import { askRentWise, fetchHealth, type Citation, type HealthInfo, type RagResponseFull } from './lib/api/client'
   import type { AskState } from './lib/types'
 
   let ask = $state<AskState>({ status: 'idle', query: '', response: null, error: null })
+  let health = $state<HealthInfo | null>(null)
+
+  $effect(() => {
+    fetchHealth().then((h) => (health = h))
+  })
+
+  const citations: Citation[] = $derived(
+    ask.response ? ((ask.response as RagResponseFull).citations ?? []) : []
+  )
 
   async function handleAsk(query: string) {
     ask = { status: 'loading', query, response: null, error: null }
@@ -26,6 +35,14 @@
       Ask questions about Boston's RentSmart housing data — violations, complaints, and
       sanitation reports, mapped.
     </p>
+    {#if health?.model}
+      <p class="powered">
+        Powered by {health.model} with
+        {health.embeddings > 0
+          ? `${health.embeddings.toLocaleString('en-US')} embeddings`
+          : 'BM25 search'} in DuckDB
+      </p>
+    {/if}
   </header>
 
   <QueryBar loading={ask.status === 'loading'} onask={handleAsk} />
@@ -51,7 +68,7 @@
         </section>
         <div class="bottom">
           <section class="sources-col card" aria-label="Sources">
-            <SourcesPanel response={ask.response} />
+            <SourcesPanel response={ask.response} {citations} />
           </section>
           <section class="map-col" aria-label="Map of locations">
             <MapPanel locations={ask.response.locations} />
@@ -90,6 +107,12 @@
     color: var(--text-muted);
     line-height: 1.5;
     font-size: 0.95rem;
+  }
+  .powered {
+    margin: 0.25rem 0 0;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.82rem;
   }
   main {
     flex: 1;

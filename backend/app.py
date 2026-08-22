@@ -76,7 +76,9 @@ def health() -> dict:
     return {
         "status": "ok",
         "llm_backend": agent.backend.name,
+        "model": getattr(agent.backend, "model", None),
         "dense_retrieval": index.dense_enabled,
+        "embeddings": index.dense_count,
         "tables": counts,
     }
 

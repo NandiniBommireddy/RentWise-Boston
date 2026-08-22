@@ -72,3 +72,22 @@ export async function askRentWise(query: string): Promise<RagResponseFull> {
 
   return (await res.json()) as RagResponseFull
 }
+
+/** GET /api/health — powers the header's "Powered by ..." line. */
+export interface HealthInfo {
+  status: string
+  llm_backend: string
+  model: string | null
+  dense_retrieval: boolean
+  embeddings: number
+  tables: Record<string, number>
+}
+
+export async function fetchHealth(): Promise<HealthInfo | null> {
+  try {
+    const res = await fetch('/api/health')
+    return res.ok ? ((await res.json()) as HealthInfo) : null
+  } catch {
+    return null
+  }
+}
