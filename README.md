@@ -2,6 +2,10 @@
 
 Project Description RentWise Boston is a mobile-friendly website with an integrated AI chatbot that helps people make informed decisions before renting a home in Boston.
 
+## Contributors
+
+- [Toci Nwaoha](https://github.com/TociNwaoha)
+
 ## Front end
 
 A single-page app (Svelte 5 + Vite + TypeScript) where you ask a question about Boston's [RentSmart](https://data.boston.gov/dataset/rentsmart) housing data and get back an LLM-generated answer alongside a Mapbox map pinning the locations it references.
