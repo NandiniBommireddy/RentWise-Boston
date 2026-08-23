@@ -5,6 +5,10 @@ Project Description RentWise Boston is a mobile-friendly website with an integra
 ## Contributors
 
 - [Toci Nwaoha](https://github.com/TociNwaoha)
+- [Harika Gummadi](https://github.com/harikagummadi582)
+- [pradyotosan](https://github.com/prady2909)
+- [Nandini Bommireddy](https://github.com/NandiniBommireddy)
+- [Jonathan Blocksom](https://github.com/jblox26)
 
 ## Front end
 
